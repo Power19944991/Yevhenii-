@@ -49,6 +49,7 @@ DATA_URL = os.environ.get(
     "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/kyiv-region.json",
 )
 REMIND_MIN = int(os.environ.get("REMIND_MIN", "15"))  # за скільки хвилин нагадувати
+DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "7"))  # ранковий дайджест о цій годині (-1 = вимкнути)
 CACHE_SECONDS = 300  # як часто тягнути дані з GitHub
 STATE_FILE = BASE_DIR / "state.json"
 TZ = ZoneInfo("Europe/Kyiv")
@@ -130,24 +131,75 @@ def day_title(d: date) -> str:
     return f"{DAYS[d.weekday()]} {d:%d.%m}"
 
 
+def fmt_dt(k: int, end: bool = False) -> str:
+    """Слот таймлайна (0..95) → «HH:MM» або «завтра HH:MM»."""
+    day, rem = divmod(k, 48)
+    if end and rem == 0 and k > 0:
+        day, rem = day - 1, 48
+    t = fmt_slot(rem)
+    return t if day == 0 else f"завтра {t}"
+
+
+def at_text(k: int) -> str:
+    """Слот таймлайна → «о 15:30» або «завтра о 02:00»."""
+    day, rem = divmod(k, 48)
+    return f"о {fmt_slot(rem)}" if day == 0 else f"завтра о {fmt_slot(rem)}"
+
+
+def fmt_range(i: int, j: int) -> str:
+    a, b = fmt_dt(i), fmt_dt(j, end=True)
+    if a.startswith("завтра") and b.startswith("завтра"):
+        b = b.replace("завтра ", "")
+    return f"{a}–{b}"
+
+
+def hour_bar(slots: list) -> str:
+    """Шкала доби: по квадратику на годину (два рядки по 12)."""
+    cells = []
+    for h in range(24):
+        a, b = slots[2 * h], slots[2 * h + 1]
+        if a == b == OFF:
+            cells.append("🟥")
+        elif OFF in (a, b):
+            cells.append("🟧")
+        elif MAYBE in (a, b):
+            cells.append("🟨")
+        else:
+            cells.append("🟩")
+    rows = [f"{s:02d}–{s + 11:02d}  " + "".join(cells[s:s + 12]) for s in (0, 12)]
+    return "\n".join(rows) + "\n🟩 є · 🟥 немає · 🟧 пів години · 🟨 можливо"
+
+
 def day_text(data: dict, d: date, label: str) -> str:
     slots, src = get_day(data, d)
     head = f"📅 {label}, {day_title(d)} · {GROUP.replace('GPV', 'черга ')}"
     if slots is None:
         return f"{head}\n\nДаних немає."
+    now = datetime.now(TZ)
+    idx = (now.hour * 60 + now.minute) // 30 if d == now.date() else None
     segs = segments(slots)
-    lines = [head, ""]
+    lines = [head, "", hour_bar(slots), ""]
     if not segs:
         lines.append("✅ Відключень не заплановано")
     for i, j, s in segs:
-        icon, word = ("🔴", "") if s == OFF else ("🟡", " (можливо)")
-        lines.append(f"{icon} {fmt_slot(i)}–{fmt_slot(j)}{word} · {fmt_hours(j - i)}")
+        text = f"{fmt_slot(i)}–{fmt_slot(j)} · {fmt_hours(j - i)}"
+        if idx is not None and j <= idx:
+            lines.append(f"▫️ {text} (було)")
+        else:
+            icon, word = ("🔴", "") if s == OFF else ("🟡", " (можливо)")
+            mark = " 👈 зараз" if idx is not None and i <= idx < j else ""
+            lines.append(f"{icon} {text}{word}{mark}")
     off = sum(j - i for i, j, s in segs if s == OFF)
     maybe = sum(j - i for i, j, s in segs if s == MAYBE)
     if off or maybe:
         lines.append("")
         if off:
-            lines.append(f"Без світла: {fmt_hours(off)}")
+            extra = ""
+            if idx is not None:
+                left = sum(j - max(i, idx) for i, j, s in segs if s == OFF and j > idx)
+                if left and left != off:
+                    extra = f", залишилось {fmt_hours(left)}"
+            lines.append(f"Без світла: {fmt_hours(off)}{extra}")
         if maybe:
             lines.append(f"Можливі відключення: {fmt_hours(maybe)}")
     if src == "preset":
@@ -158,37 +210,58 @@ def day_text(data: dict, d: date, label: str) -> str:
 
 
 def build_timeline(data: dict, start: date, days: int = 2):
-    tl = []
+    """Слоти кількох днів підряд + джерело кожного дня."""
+    tl, srcs = [], []
     for n in range(days):
-        slots, _ = get_day(data, start + timedelta(days=n))
+        slots, src = get_day(data, start + timedelta(days=n))
         tl += slots if slots else [None] * 48
-    return tl
+        srcs.append(src)
+    return tl, srcs
 
 
 def now_text(data: dict) -> str:
     now = datetime.now(TZ)
-    day0 = datetime(now.year, now.month, now.day, tzinfo=TZ)
-    tl = build_timeline(data, now.date())
+    tl, srcs = build_timeline(data, now.date())
     idx = (now.hour * 60 + now.minute) // 30
     cur = tl[idx]
     if cur is None:
         return "Даних про поточний час немає."
+    known = tl if srcs[1] == "fact" else tl[:48]  # орієнтовний шаблон на завтра не враховуємо
     k = idx
-    while k < len(tl) and tl[k] == cur:
+    while k < len(known) and known[k] == cur:
         k += 1
-    change = day0 + timedelta(minutes=30 * k) if k < len(tl) and tl[k] is not None else None
-    until = f"{change:%H:%M} (через {fmt_delta(change - now)})" if change else None
+    day0 = datetime(now.year, now.month, now.day, tzinfo=TZ)
+    change = day0 + timedelta(minutes=30 * k) if k < len(known) and known[k] is not None else None
+    until = f"{at_text(k)} (через {fmt_delta(change - now)})" if change else None
     if cur == ON:
-        if change:
-            return f"🟢 Світло має бути.\nНаступна зміна — о {until}."
-        return "🟢 Світло має бути.\nДо кінця відомого графіка відключень немає."
-    if cur == OFF:
-        if change:
-            return f"🔴 За графіком світла немає.\nМає з'явитись о {until}."
-        return "🔴 За графіком світла немає.\nЧас повернення ще невідомий (графік на завтра не опубліковано)."
-    if change:
-        return f"🟡 Зараз можливе відключення.\nСтатус зміниться о {until}."
-    return "🟡 Зараз можливе відключення."
+        head = (f"🟢 Світло має бути.\nНаступна зміна — {until}." if change
+                else "🟢 Світло має бути.\nДо кінця відомого графіка відключень немає.")
+    elif cur == OFF:
+        head = (f"🔴 За графіком світла немає.\nМає з'явитись {until}." if change
+                else "🔴 За графіком світла немає.\nЧас повернення ще невідомий (графік на завтра не опубліковано).")
+    else:
+        head = (f"🟡 Зараз можливе відключення.\nСтатус зміниться {until}." if change
+                else "🟡 Зараз можливе відключення.")
+    lines = [head]
+    tomorrow_known = srcs[1] == "fact"
+    ups = [s for s in segments(tl) if s[0] > idx and (s[0] < 48 or tomorrow_known)][:3]
+    if ups:
+        lines += ["", "Далі:"]
+        for i, j, s in ups:
+            icon, word = ("🔴", "") if s == OFF else ("🟡", " (можливо)")
+            lines.append(f"{icon} {fmt_range(i, j)} · {fmt_hours(j - i)}{word}")
+    if srcs[1] == "preset":
+        lines += ["", "Графік на завтра ще не опубліковано."]
+    today_off = [s for s in segments(tl[:48]) if s[2] == OFF]
+    total = sum(j - i for i, j, s in today_off)
+    if total:
+        left = sum(j - max(i, idx) for i, j, s in today_off if j > idx)
+        tail = f", залишилось {fmt_hours(left)}" if left else ", більше сьогодні не буде"
+        lines += ["", f"Сьогодні без світла: {fmt_hours(total)}{tail}"]
+    update = (data.get("fact") or {}).get("update")
+    if update:
+        lines += ["", f"Дані оновлено: {update}"]
+    return "\n".join(lines)
 
 
 # ───────────────────────── Дані та стан ─────────────────────────
@@ -306,7 +379,7 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     day0 = datetime(now.year, now.month, now.day, tzinfo=TZ)
     changed_state = False
 
-    # 1) графік змінився?
+    # 1) з'явився графік на завтра або графік змінився?
     for n in (0, 1):
         d = today + timedelta(days=n)
         slots, src = get_day(data, d)
@@ -315,12 +388,24 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if old != sig:
             STATE["sigs"][d.isoformat()] = sig
             changed_state = True
-            if old is not None and sig != "none":
-                await broadcast(ctx.bot, "🔄 Графік змінився!\n\n" + day_text(data, d, "Сьогодні" if n == 0 else "Завтра"))
+            if old is not None and sig != "none" and not sig.startswith("preset"):
+                if old.startswith(("preset", "none")):
+                    title = f"📢 Опубліковано графік на {day_title(d)}"
+                else:
+                    title = "🔄 Графік змінився!"
+                await broadcast(ctx.bot, f"{title}\n\n" + day_text(data, d, "Сьогодні" if n == 0 else "Завтра"))
     STATE["sigs"] = {k: v for k, v in STATE["sigs"].items() if k >= today.isoformat()}
 
-    # 2) нагадування про відключення та повернення світла
-    tl = build_timeline(data, today)
+    # 2) ранковий дайджест (перший запуск після DIGEST_HOUR)
+    if 0 <= DIGEST_HOUR <= now.hour < DIGEST_HOUR + 5:
+        key = f"digest:{today.isoformat()}"
+        if key not in STATE["sent"]:
+            STATE["sent"][key] = now.isoformat()
+            changed_state = True
+            await broadcast(ctx.bot, "☀️ Доброго ранку! Графік на сьогодні:\n\n" + day_text(data, today, "Сьогодні"))
+
+    # 3) нагадування про відключення та повернення світла
+    tl, _ = build_timeline(data, today)
     for i, j, s in segments(tl):
         if s != OFF:
             continue
@@ -331,17 +416,23 @@ async def tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if key not in STATE["sent"]:
                 STATE["sent"][key] = now.isoformat()
                 changed_state = True
-                await broadcast(
-                    ctx.bot,
-                    f"⚠️ Через {fmt_delta(start - now)} відключення світла\n"
-                    f"🔴 {start:%H:%M}–{end:%H:%M} · {fmt_hours(j - i)}",
-                )
+                text = (f"⚠️ Через {fmt_delta(start - now)} відключення світла\n"
+                        f"🔴 {fmt_range(i, j)} · {fmt_hours(j - i)}")
+                if j - i >= 6:  # від 3 годин
+                    text += "\n🔋 Довге відключення: перевірте, що станції й телефони заряджені."
+                await broadcast(ctx.bot, text)
         if j < len(tl) and tl[j] is not None and timedelta(0) <= now - end < timedelta(minutes=10):
             key = f"post:{end.isoformat()}"
             if key not in STATE["sent"]:
                 STATE["sent"][key] = now.isoformat()
                 changed_state = True
-                await broadcast(ctx.bot, "💡 Світло має з'явитись зараз (за графіком).")
+                text = "💡 Світло має з'явитись зараз (за графіком)."
+                nxt = next((x for x in segments(tl) if x[0] >= j and x[2] == OFF), None)
+                if nxt:
+                    text += f"\nНаступне відключення: {fmt_range(nxt[0], nxt[1])} · {fmt_hours(nxt[1] - nxt[0])}"
+                else:
+                    text += "\nЗа відомим графіком більше відключень немає."
+                await broadcast(ctx.bot, text)
 
     # чистимо старі записи
     cutoff = now - timedelta(days=3)
