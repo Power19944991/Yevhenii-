@@ -166,8 +166,8 @@ def hour_bar(slots: list) -> str:
             cells.append("🟨")
         else:
             cells.append("🟩")
-    rows = [f"{s:02d}–{s + 11:02d}  " + "".join(cells[s:s + 12]) for s in (0, 12)]
-    return "\n".join(rows) + "\n🟩 є · 🟥 немає · 🟧 пів години · 🟨 можливо"
+    rows = [f"{s:02d}–{s + 7:02d}  " + "".join(cells[s:s + 8]) for s in (0, 8, 16)]
+    return "\n".join(rows) + "\n🟩 є · 🟥 немає\n🟧 пів години · 🟨 можливо"
 
 
 def day_text(data: dict, d: date, label: str) -> str:
