@@ -153,21 +153,19 @@ def fmt_range(i: int, j: int) -> str:
     return f"{a}–{b}"
 
 
-def hour_bar(slots: list) -> str:
-    """Шкала доби: по квадратику на годину (два рядки по 12)."""
-    cells = []
-    for h in range(24):
-        a, b = slots[2 * h], slots[2 * h + 1]
-        if a == b == OFF:
-            cells.append("🟥")
-        elif OFF in (a, b):
-            cells.append("🟧")
-        elif MAYBE in (a, b):
-            cells.append("🟨")
-        else:
-            cells.append("🟩")
-    rows = [f"{s:02d}–{s + 7:02d}  " + "".join(cells[s:s + 8]) for s in (0, 8, 16)]
-    return "\n".join(rows) + "\n🟩 є · 🟥 немає\n🟧 пів години · 🟨 можливо"
+LABEL = {ON: ("🟢", "Є світло"), OFF: ("🔴", "Немає світла"), MAYBE: ("🟡", "Можливе відключення")}
+
+
+def runs(slots: list) -> list:
+    """Усі проміжки доби підряд: [(початок, кінець, статус)] у слотах."""
+    out, i = [], 0
+    while i < len(slots):
+        j = i
+        while j < len(slots) and slots[j] == slots[i]:
+            j += 1
+        out.append((i, j, slots[i]))
+        i = j
+    return out
 
 
 def day_text(data: dict, d: date, label: str) -> str:
@@ -177,29 +175,29 @@ def day_text(data: dict, d: date, label: str) -> str:
         return f"{head}\n\nДаних немає."
     now = datetime.now(TZ)
     idx = (now.hour * 60 + now.minute) // 30 if d == now.date() else None
-    segs = segments(slots)
-    lines = [head, "", hour_bar(slots), ""]
-    if not segs:
-        lines.append("✅ Відключень не заплановано")
-    for i, j, s in segs:
-        text = f"{fmt_slot(i)}–{fmt_slot(j)} · {fmt_hours(j - i)}"
+    lines = [head, ""]
+    for i, j, s in runs(slots):
+        icon, word = LABEL[s]
+        text = f"{fmt_slot(i)}–{fmt_slot(j)} ({fmt_hours(j - i)})"
         if idx is not None and j <= idx:
-            lines.append(f"▫️ {text} (було)")
+            lines.append(f"▫️ {word}: {text} — було")
         else:
-            icon, word = ("🔴", "") if s == OFF else ("🟡", " (можливо)")
             mark = " 👈 зараз" if idx is not None and i <= idx < j else ""
-            lines.append(f"{icon} {text}{word}{mark}")
-    off = sum(j - i for i, j, s in segs if s == OFF)
-    maybe = sum(j - i for i, j, s in segs if s == MAYBE)
-    if off or maybe:
-        lines.append("")
+            lines.append(f"{icon} {word}: {text}{mark}")
+    off = sum(j - i for i, j, s in runs(slots) if s == OFF)
+    maybe = sum(j - i for i, j, s in runs(slots) if s == MAYBE)
+    on = sum(j - i for i, j, s in runs(slots) if s == ON)
+    lines.append("")
+    if not off and not maybe:
+        lines.append("✅ Відключень не заплановано")
+    else:
         if off:
             extra = ""
             if idx is not None:
-                left = sum(j - max(i, idx) for i, j, s in segs if s == OFF and j > idx)
+                left = sum(j - max(i, idx) for i, j, s in runs(slots) if s == OFF and j > idx)
                 if left and left != off:
-                    extra = f", залишилось {fmt_hours(left)}"
-            lines.append(f"Без світла: {fmt_hours(off)}{extra}")
+                    extra = f" (ще {fmt_hours(left)})"
+            lines.append(f"Без світла: {fmt_hours(off)}{extra} · зі світлом: {fmt_hours(on)}")
         if maybe:
             lines.append(f"Можливі відключення: {fmt_hours(maybe)}")
     if src == "preset":
